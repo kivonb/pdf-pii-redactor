@@ -23,6 +23,22 @@ From this folder:
 
 ## Run
 
+Launch the desktop UI:
+
+```powershell
+.\run-ui.cmd
+```
+
+Or run the jar directly:
+
+```powershell
+..\.tools\java\jdk-21.0.11+10\bin\java.exe -jar target\pdf-pii-redactor-1.0.0.jar
+```
+
+The UI lets you attach one or more PDFs, choose an output folder, and redact them locally. The default output folder is `E:\Redacted`.
+
+Run from the command line:
+
 ```powershell
 ..\.tools\java\jdk-21.0.11+10\bin\java.exe -jar target\pdf-pii-redactor-1.0.0.jar --input C:\path\sensitive.pdf --output C:\path\scrubbed.pdf
 ```

@@ -12,10 +12,9 @@ import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.pdfbox.text.TextPosition;
 
-import javax.imageio.ImageIO;
+import javax.swing.SwingUtilities;
 import java.awt.Color;
 import java.awt.Graphics2D;
-import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -49,13 +48,18 @@ public final class PdfPiiRedactor {
     }
 
     public static void main(String[] args) {
+        if (args.length == 0) {
+            SwingUtilities.invokeLater(PdfPiiRedactorUi::show);
+            return;
+        }
+
         try {
             CliOptions options = CliOptions.parse(args);
             if (options.help) {
                 printUsage();
                 return;
             }
-            RedactionReport report = redact(options);
+            RedactionReport report = redact(options.input, options.output, options.termsFile, options.dpi);
             System.out.printf(Locale.ROOT,
                     "Wrote %s%nRedacted %d match(es) across %d page(s).%n",
                     options.output, report.matchCount, report.pagesWithMatches);
@@ -73,10 +77,23 @@ public final class PdfPiiRedactor {
         }
     }
 
-    private static RedactionReport redact(CliOptions options) throws IOException {
-        List<String> terms = readTerms(options.termsFile);
-        try (PDDocument source = Loader.loadPDF(options.input.toFile());
-             PDDocument output = new PDDocument()) {
+    public static RedactionReport redact(Path input, Path output, Path termsFile, int dpi) throws IOException {
+        if (!Files.isRegularFile(input)) {
+            throw new IllegalArgumentException("Input PDF does not exist: " + input);
+        }
+        if (output.toAbsolutePath().getParent() == null) {
+            throw new IllegalArgumentException("Output must include a writable parent path.");
+        }
+        if (termsFile != null && !Files.isRegularFile(termsFile)) {
+            throw new IllegalArgumentException("Terms file does not exist: " + termsFile);
+        }
+        if (dpi < 96 || dpi > 600) {
+            throw new IllegalArgumentException("DPI must be between 96 and 600.");
+        }
+
+        List<String> terms = readTerms(termsFile);
+        try (PDDocument source = Loader.loadPDF(input.toFile());
+             PDDocument outputDocument = new PDDocument()) {
             PDFRenderer renderer = new PDFRenderer(source);
             RedactionExtractor extractor = new RedactionExtractor(terms);
             extractor.setSortByPosition(true);
@@ -95,13 +112,13 @@ public final class PdfPiiRedactor {
                     totalMatches += boxes.size();
                 }
 
-                BufferedImage image = renderer.renderImageWithDPI(pageIndex, options.dpi, ImageType.RGB);
-                paintRedactions(image, boxes, options.dpi);
-                addImagePage(source.getPage(pageIndex), output, image);
+                BufferedImage image = renderer.renderImageWithDPI(pageIndex, dpi, ImageType.RGB);
+                paintRedactions(image, boxes, dpi);
+                addImagePage(source.getPage(pageIndex), outputDocument, image);
             }
 
-            Files.createDirectories(options.output.toAbsolutePath().getParent());
-            output.save(options.output.toFile());
+            Files.createDirectories(output.toAbsolutePath().getParent());
+            outputDocument.save(output.toFile());
             return new RedactionReport(totalMatches, pagesWithMatches);
         }
     }
@@ -176,7 +193,7 @@ public final class PdfPiiRedactor {
     private record Detector(String name, Pattern pattern) {
     }
 
-    private record RedactionReport(int matchCount, int pagesWithMatches) {
+    public record RedactionReport(int matchCount, int pagesWithMatches) {
     }
 
     private static final class RedactionBox {
