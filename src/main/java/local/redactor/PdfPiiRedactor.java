@@ -37,11 +37,16 @@ public final class PdfPiiRedactor {
             new Detector("ssn", Pattern.compile("\\b\\d{3}[- ]?\\d{2}[- ]?\\d{4}\\b")),
             new Detector("phone", Pattern.compile("(?<!\\d)(?:\\+?1[ .-]?)?(?:\\(?\\d{3}\\)?[ .-]?)\\d{3}[ .-]?\\d{4}(?!\\d)")),
             new Detector("credit-card", Pattern.compile("(?<!\\d)(?:\\d[ -]?){13,19}(?!\\d)")),
+            new Detector("brokerage-account-compound", Pattern.compile("\\b\\d{3}S\\d{8,12}S\\d{4}\\b", Pattern.CASE_INSENSITIVE)),
+            new Detector("brokerage-account-hyphenated", Pattern.compile("\\b\\d{3}-\\d{5}\\b")),
+            new Detector("brokerage-account-parenthesized", Pattern.compile("(?<=\\()\\d{8}(?=\\))")),
             new Detector("date-of-birth-label", Pattern.compile("\\b(?:DOB|D\\.O\\.B\\.|Date of Birth|Birth Date)\\s*[:#-]?\\s*\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}\\b", Pattern.CASE_INSENSITIVE)),
             new Detector("us-passport-label", Pattern.compile("\\b(?:Passport|Passport No\\.?|Passport Number)\\s*[:#-]?\\s*[A-Z0-9]{6,9}\\b", Pattern.CASE_INSENSITIVE)),
             new Detector("driver-license-label", Pattern.compile("\\b(?:Driver'?s License|DL No\\.?|License No\\.?)\\s*[:#-]?\\s*[A-Z0-9 -]{5,20}\\b", Pattern.CASE_INSENSITIVE)),
             new Detector("bank-routing-label", Pattern.compile("\\b(?:Routing|ABA)\\s*(?:No\\.?|Number)?\\s*[:#-]?\\s*\\d{9}\\b", Pattern.CASE_INSENSITIVE)),
-            new Detector("bank-account-label", Pattern.compile("\\b(?:Account|Acct)\\s*(?:No\\.?|Number|#)?\\s*[:#-]?\\s*[A-Z0-9-]{6,24}\\b", Pattern.CASE_INSENSITIVE))
+            new Detector("bank-account-label", Pattern.compile("\\b(?:Account|Acct)\\s*(?:No\\.?|Number|#)?\\s*[:#-]?\\s*[A-Z0-9-]{6,24}\\b", Pattern.CASE_INSENSITIVE)),
+            new Detector("street-address", Pattern.compile("\\b\\d{1,6}\\s+[A-Z0-9 .'-]+\\s(?:ST|STREET|RD|ROAD|AVE|AVENUE|CIR|CIRCLE|DR|DRIVE|LN|LANE|BLVD|CT|COURT|WAY|PL|PLACE)\\b", Pattern.CASE_INSENSITIVE)),
+            new Detector("city-state-zip", Pattern.compile("\\b[A-Z][A-Z .'-]+,?\\s+[A-Z]{2}\\s+\\d{5}(?:-\\d{4})?\\b"))
     );
 
     private PdfPiiRedactor() {
@@ -91,11 +96,11 @@ public final class PdfPiiRedactor {
             throw new IllegalArgumentException("DPI must be between 96 and 600.");
         }
 
-        List<String> terms = readTerms(termsFile);
         try (PDDocument source = Loader.loadPDF(input.toFile());
              PDDocument outputDocument = new PDDocument()) {
+            RedactionContext context = collectRedactionContext(source, termsFile);
             PDFRenderer renderer = new PDFRenderer(source);
-            RedactionExtractor extractor = new RedactionExtractor(terms);
+            RedactionExtractor extractor = new RedactionExtractor(context.terms);
             extractor.setSortByPosition(true);
             int totalMatches = 0;
             int pagesWithMatches = 0;
@@ -105,8 +110,12 @@ public final class PdfPiiRedactor {
                 extractor.setEndPage(pageIndex + 1);
                 extractor.clear();
                 extractor.getText(source);
+                extractor.detectVisualPatterns();
 
-                List<RedactionBox> boxes = extractor.boxes();
+                List<RedactionBox> boxes = new ArrayList<>(extractor.boxes());
+                if (pageIndex == 0 && context.hasInvestmentRepresentativeContact) {
+                    boxes.add(new RedactionBox(110, 318, 220, 360));
+                }
                 if (!boxes.isEmpty()) {
                     pagesWithMatches++;
                     totalMatches += boxes.size();
@@ -121,6 +130,84 @@ public final class PdfPiiRedactor {
             outputDocument.save(output.toFile());
             return new RedactionReport(totalMatches, pagesWithMatches);
         }
+    }
+
+    private static RedactionContext collectRedactionContext(PDDocument source, Path termsFile) throws IOException {
+        LinkedHashSet<String> terms = new LinkedHashSet<>(readTerms(termsFile));
+        String text = new PDFTextStripper().getText(source);
+        inferStatementTerms(text, terms);
+        boolean hasInvestmentRepresentativeContact = text.toLowerCase(Locale.ROOT).contains("call investment representative");
+        return new RedactionContext(List.copyOf(terms), hasInvestmentRepresentativeContact);
+    }
+
+    private static void inferStatementTerms(String text, Set<String> terms) {
+        String[] lines = text.replace("\r\n", "\n").replace('\r', '\n').split("\n");
+        for (int i = 0; i < lines.length; i++) {
+            String line = normalizeLine(lines[i]);
+            if (line.isBlank()) {
+                continue;
+            }
+
+            inferAccountHolderTerms(line, previousNonBlank(lines, i), terms);
+            inferAdvisorTerms(line, nextNonBlank(lines, i), terms);
+        }
+    }
+
+    private static void inferAccountHolderTerms(String line, String previousLine, Set<String> terms) {
+        String upper = line.toUpperCase(Locale.ROOT);
+        if (!upper.contains("JTWROS")) {
+            return;
+        }
+
+        String beforeRegistration = line.replaceAll("(?i)\\bJTWROS\\b.*", "").trim();
+        addLikelyNameTerm(beforeRegistration, terms);
+        if (previousLine.endsWith("&")) {
+            addLikelyNameTerm(previousLine.substring(0, previousLine.length() - 1), terms);
+        }
+    }
+
+    private static void inferAdvisorTerms(String line, String nextLine, Set<String> terms) {
+        if (!line.matches("[A-Z][a-zA-Z'.-]+(?:\\s+[A-Z][a-zA-Z'.-]+){1,3}")) {
+            return;
+        }
+        if (nextLine.matches("(?i).*\\b\\d{1,6}\\s+.+\\b(?:ST|STREET|RD|ROAD|AVE|AVENUE|CIR|CIRCLE|DR|DRIVE|LN|LANE|BLVD|CT|COURT|WAY|PL|PLACE)\\b.*")) {
+            addLikelyNameTerm(line, terms);
+        }
+    }
+
+    private static void addLikelyNameTerm(String value, Set<String> terms) {
+        String normalized = normalizeLine(value.replace("&", ""));
+        if (normalized.length() < 5 || normalized.length() > 80) {
+            return;
+        }
+        if (normalized.matches(".*\\d.*") || normalized.split("\\s+").length < 2) {
+            return;
+        }
+        terms.add(normalized);
+    }
+
+    private static String previousNonBlank(String[] lines, int index) {
+        for (int i = index - 1; i >= 0; i--) {
+            String candidate = normalizeLine(lines[i]);
+            if (!candidate.isBlank()) {
+                return candidate;
+            }
+        }
+        return "";
+    }
+
+    private static String nextNonBlank(String[] lines, int index) {
+        for (int i = index + 1; i < lines.length; i++) {
+            String candidate = normalizeLine(lines[i]);
+            if (!candidate.isBlank()) {
+                return candidate;
+            }
+        }
+        return "";
+    }
+
+    private static String normalizeLine(String line) {
+        return line.replace('\uFFFD', ' ').replaceAll("\\s+", " ").trim();
     }
 
     private static void paintRedactions(BufferedImage image, List<RedactionBox> boxes, int dpi) {
@@ -196,6 +283,9 @@ public final class PdfPiiRedactor {
     public record RedactionReport(int matchCount, int pagesWithMatches) {
     }
 
+    private record RedactionContext(List<String> terms, boolean hasInvestmentRepresentativeContact) {
+    }
+
     private static final class RedactionBox {
         private final float left;
         private final float top;
@@ -214,6 +304,7 @@ public final class PdfPiiRedactor {
         private final List<String> terms;
         private final Set<String> seen = new LinkedHashSet<>();
         private final List<RedactionBox> boxes = new ArrayList<>();
+        private final List<TextPosition> pagePositions = new ArrayList<>();
 
         private RedactionExtractor(List<String> terms) throws IOException {
             this.terms = terms.stream().map(term -> term.toLowerCase(Locale.ROOT)).toList();
@@ -222,6 +313,7 @@ public final class PdfPiiRedactor {
         private void clear() {
             seen.clear();
             boxes.clear();
+            pagePositions.clear();
         }
 
         private List<RedactionBox> boxes() {
@@ -232,6 +324,25 @@ public final class PdfPiiRedactor {
         protected void writeString(String text, List<TextPosition> textPositions) {
             detectBuiltIns(text, textPositions);
             detectTerms(text, textPositions);
+            detectLikelyPersonLine(text, textPositions);
+        }
+
+        @Override
+        protected void processTextPosition(TextPosition text) {
+            pagePositions.add(text);
+            super.processTextPosition(text);
+        }
+
+        private void detectVisualPatterns() {
+            for (List<TextPosition> line : splitByLine(pagePositions)) {
+                String text = visualLineText(line);
+                if (text.matches(".*(?:\\(?\\d{3}\\)?[ .-]?\\d{3}[ .-]?\\d{4})\\s+[A-Z][a-z]{2,}\\s+[A-Z][a-z]{2,}.*")) {
+                    addLineBox("visual-phone-name", line);
+                }
+                if (text.toLowerCase(Locale.ROOT).contains("call investment representative")) {
+                    addAdvisorSlotBox(line);
+                }
+            }
         }
 
         private void detectBuiltIns(String text, List<TextPosition> positions) {
@@ -261,6 +372,28 @@ public final class PdfPiiRedactor {
             }
         }
 
+        private void detectLikelyPersonLine(String text, List<TextPosition> positions) {
+            String trimmed = text.trim();
+            if (!trimmed.matches("[A-Z][a-z]{2,}(?:\\s+[A-Z][a-z]{2,}){1,2}")) {
+                return;
+            }
+            String lower = trimmed.toLowerCase(Locale.ROOT);
+            List<String> stopWords = List.of(
+                    "account", "accruals", "activity", "address", "advisory", "allocation",
+                    "asset", "branch", "cash", "chase", "client", "closing", "corporation",
+                    "customer", "equities", "financial", "important", "information",
+                    "investment", "managed", "management", "market", "morgan", "period",
+                    "portfolio", "previous", "questions", "securities", "service",
+                    "statement", "summary", "total", "value"
+            );
+            for (String stopWord : stopWords) {
+                if (lower.contains(stopWord)) {
+                    return;
+                }
+            }
+            addBoxes("likely-person-line", 0, text.length(), positions);
+        }
+
         private void addBoxes(String type, int start, int end, List<TextPosition> positions) {
             int safeStart = Math.max(0, Math.min(start, positions.size()));
             int safeEnd = Math.max(safeStart, Math.min(end, positions.size()));
@@ -288,6 +421,70 @@ public final class PdfPiiRedactor {
                     boxes.add(new RedactionBox(left, top, right, bottom));
                 }
             }
+        }
+
+        private void addLineBox(String type, List<TextPosition> line) {
+            List<TextPosition> visible = line.stream()
+                    .filter(position -> !position.getUnicode().isBlank())
+                    .toList();
+            if (visible.isEmpty()) {
+                return;
+            }
+            float left = Float.MAX_VALUE;
+            float top = Float.MAX_VALUE;
+            float right = 0;
+            float bottom = 0;
+            for (TextPosition position : visible) {
+                left = Math.min(left, position.getXDirAdj());
+                top = Math.min(top, position.getYDirAdj() - position.getHeightDir());
+                right = Math.max(right, position.getXDirAdj() + position.getWidthDirAdj());
+                bottom = Math.max(bottom, position.getYDirAdj());
+            }
+            String key = type + ":" + Math.round(left) + ":" + Math.round(top) + ":" + Math.round(right) + ":" + Math.round(bottom);
+            if (seen.add(key)) {
+                boxes.add(new RedactionBox(left, top, right, bottom));
+            }
+        }
+
+        private void addAdvisorSlotBox(List<TextPosition> labelLine) {
+            if (labelLine.isEmpty()) {
+                return;
+            }
+            float left = Float.MAX_VALUE;
+            float bottom = 0;
+            float height = 0;
+            for (TextPosition position : labelLine) {
+                left = Math.min(left, position.getXDirAdj());
+                bottom = Math.max(bottom, position.getYDirAdj());
+                height = Math.max(height, position.getHeightDir());
+            }
+            float advisorLeft = left + 100;
+            float advisorTop = bottom + Math.max(8, height * 0.8f);
+            float advisorRight = advisorLeft + 125;
+            float advisorBottom = advisorTop + Math.max(13, height * 1.4f);
+            String key = "advisor-slot:" + Math.round(advisorLeft) + ":" + Math.round(advisorTop);
+            if (seen.add(key)) {
+                boxes.add(new RedactionBox(advisorLeft, advisorTop, advisorRight, advisorBottom));
+            }
+        }
+
+        private static String visualLineText(List<TextPosition> line) {
+            List<TextPosition> sorted = line.stream()
+                    .sorted(Comparator.comparing(TextPosition::getXDirAdj))
+                    .toList();
+            StringBuilder text = new StringBuilder();
+            float previousRight = -1;
+            for (TextPosition position : sorted) {
+                if (position.getUnicode().isBlank()) {
+                    continue;
+                }
+                if (previousRight >= 0 && position.getXDirAdj() - previousRight > Math.max(2.5f, position.getWidthOfSpace())) {
+                    text.append(' ');
+                }
+                text.append(position.getUnicode());
+                previousRight = position.getXDirAdj() + position.getWidthDirAdj();
+            }
+            return normalizeLine(text.toString());
         }
 
         private static List<List<TextPosition>> splitByLine(List<TextPosition> positions) {
