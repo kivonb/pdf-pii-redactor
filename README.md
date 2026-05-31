@@ -26,6 +26,12 @@ From this folder:
 Launch the desktop UI:
 
 ```powershell
+.\PDF PII Redactor.cmd
+```
+
+You can also double-click `PDF PII Redactor.vbs` to launch without opening a console window.
+
+```powershell
 .\run-ui.cmd
 ```
 
